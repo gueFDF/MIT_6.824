@@ -10,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 // 枚举任务类型
@@ -20,17 +21,10 @@ const (
 	TYPE_EXIT   = "exit"
 )
 
-// 枚举任务状态
-const (
-	ST_WAIT = iota
-	ST_ING
-	ST_FIN
-)
-
 // 封装任务
 type MRTask struct {
 	TaskType string //任务类型
-	Status   string //任务状态
+	T        string
 	Arg      string //参数
 	Nreduce  int
 }
@@ -82,45 +76,88 @@ func (t *Task_queue) getTask() (*MRTask, error) {
 	}
 }
 
+// 获取长度
+func (t *Task_queue) getLen() uint32 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return uint32(len(t.tasks))
+}
+
 type Coordinator struct {
 	map_queue    Task_queue //map任务队列
 	reduce_queue Task_queue //reduce任务队列
 	Nreduce      int
 	isMap        bool //Map任务是否已经全部完成
 	isReduce     bool //Reduce任务是否已经全部完成
+	Map_ing      map[string]*MRTask
+	mu           sync.Mutex //用来维护map_ing
 }
 
 // 用于RPC远程调用
 func (c *Coordinator) GetTask(request Request, response *Response) error {
 	var err error
+	log.Println("GetTask 被调用")
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.isMap {
 		//先判断map任务是否已经全部完成
 		//未全部完成
 		task, err := c.map_queue.getTask()
-		if err == nil {
-			request.Task = *WaitTask
+		if err != nil {
+			response.Task = *WaitTask
+			log.Println("拿到MapWait任务")
 		} else {
-			request.Task = *task
+			c.Map_ing[task.T] = task
+			response.Task = *task
+			log.Println("拿到Map任务")
+
 		}
 	} else if !c.isReduce {
 		//map任务已经全部完成，reduce任务未全部完成
-		task, err := c.map_queue.getTask()
+		task, err := c.reduce_queue.getTask()
 		if err != nil {
-			request.Task = *WaitTask
+			response.Task = *WaitTask
+			log.Println("拿到reduce wait任务")
 		} else {
-			request.Task = *task
+			c.Map_ing[task.T] = task
+			response.Task = *task
+			log.Println("拿到reduce任务")
+
 		}
 	} else {
-		request.Task = *ExitTask
+		response.Task = *ExitTask
 	}
 	return err
+}
+
+func (c *Coordinator) SendAck(request Ack, response *Ack) error {
+	log.Println("SendAck 被调用")
+	task, ok := c.Map_ing[request.Time]
+	if !ok {
+		log.Println(request.Time, " SendAck error,未找到对用任务")
+		return nil
+	}
+
+	//判断是什么任务
+	switch task.TaskType {
+	case TYPE_MAP:
+		//TODO:更改task,然后将任务加到reduce任务队列当中
+		task.TaskType = TYPE_REDUCE
+		c.reduce_queue.add(task)
+		delete(c.Map_ing, request.Time)
+	case TYPE_REDUCE:
+		delete(c.Map_ing, request.Time)
+	}
+	response = &request
+
+	return nil
 }
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
+	//l, e := net.Listen("tcp", "localhost:9999")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -133,10 +170,20 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := true
-
-	// Your code here.
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ret := false
+	if !c.isMap {
+		if c.map_queue.getLen() == 0 && len(c.Map_ing) == 0 {
+			c.isMap = true
+		}
+	} else if !c.isReduce {
+		if c.reduce_queue.getLen() == 0 && len(c.Map_ing) == 0 {
+			c.isReduce = true
+		}
+	} else {
+		ret = true
+	}
 	return ret
 }
 
@@ -144,8 +191,13 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	c.Nreduce = nReduce
+	c := Coordinator{
+		isMap:    false,
+		isReduce: false,
+		Map_ing:  make(map[string]*MRTask),
+		Nreduce:  nReduce,
+	}
+
 	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
@@ -160,8 +212,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			FileName: filename,
 			Content:  string(content),
 		}
+		temp, _ := json.Marshal(pra)
 		c.map_queue.add(&MRTask{
-			
+			TaskType: TYPE_MAP,
+			T:        time.Now().String(),
+			Arg:      string(temp),
+			Nreduce:  nReduce,
 		})
 	}
 
