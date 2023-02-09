@@ -11,19 +11,6 @@ import (
 	"strconv"
 )
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 type Request struct {
 	Task MRTask
 }
@@ -33,7 +20,7 @@ type Response struct {
 }
 
 type Ack struct {
-	Time string
+	Id uint32
 }
 
 // Add your RPC definitions here.

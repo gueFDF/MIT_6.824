@@ -10,7 +10,6 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
-	"time"
 )
 
 // 枚举任务类型
@@ -21,14 +20,17 @@ const (
 	TYPE_EXIT   = "exit"
 )
 
+// 任务ID
+var ID uint32 = 0
+
 // 封装任务
 type MRTask struct {
 	TaskType string //任务类型
-	T        string
+	Id       uint32 //任务ID
 	Arg      string //参数
 	Nreduce  int
 }
-type arg_map struct {
+type Arg_map struct {
 	FileName string
 	Content  string
 }
@@ -89,7 +91,7 @@ type Coordinator struct {
 	Nreduce      int
 	isMap        bool //Map任务是否已经全部完成
 	isReduce     bool //Reduce任务是否已经全部完成
-	Map_ing      map[string]*MRTask
+	Map_ing      map[uint32]*MRTask
 	mu           sync.Mutex //用来维护map_ing
 }
 
@@ -107,9 +109,9 @@ func (c *Coordinator) GetTask(request Request, response *Response) error {
 			response.Task = *WaitTask
 			log.Println("拿到MapWait任务")
 		} else {
-			c.Map_ing[task.T] = task
+			c.Map_ing[task.Id] = task
 			response.Task = *task
-			log.Println("拿到Map任务")
+			log.Println("拿到Map任务 ",task.Id)
 
 		}
 	} else if !c.isReduce {
@@ -119,9 +121,9 @@ func (c *Coordinator) GetTask(request Request, response *Response) error {
 			response.Task = *WaitTask
 			log.Println("拿到reduce wait任务")
 		} else {
-			c.Map_ing[task.T] = task
+			c.Map_ing[task.Id] = task
 			response.Task = *task
-			log.Println("拿到reduce任务")
+			log.Println("拿到reduce任务 ",task.Id)
 
 		}
 	} else {
@@ -132,9 +134,11 @@ func (c *Coordinator) GetTask(request Request, response *Response) error {
 
 func (c *Coordinator) SendAck(request Ack, response *Ack) error {
 	log.Println("SendAck 被调用")
-	task, ok := c.Map_ing[request.Time]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	task, ok := c.Map_ing[request.Id]
 	if !ok {
-		log.Println(request.Time, " SendAck error,未找到对用任务")
+		log.Println(request.Id, " SendAck error,未找到对应任务")
 		return nil
 	}
 
@@ -143,10 +147,13 @@ func (c *Coordinator) SendAck(request Ack, response *Ack) error {
 	case TYPE_MAP:
 		//TODO:更改task,然后将任务加到reduce任务队列当中
 		task.TaskType = TYPE_REDUCE
+		task.Arg=" "
 		c.reduce_queue.add(task)
-		delete(c.Map_ing, request.Time)
+		delete(c.Map_ing, request.Id)
+		log.Println(task.Id," Map 被删除，加入Reduce")
 	case TYPE_REDUCE:
-		delete(c.Map_ing, request.Time)
+		delete(c.Map_ing, request.Id)
+		log.Println(task.TaskType," ",task.Id," Reduce被删除")
 	}
 	response = &request
 
@@ -194,7 +201,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		isMap:    false,
 		isReduce: false,
-		Map_ing:  make(map[string]*MRTask),
+		Map_ing:  make(map[uint32]*MRTask),
 		Nreduce:  nReduce,
 	}
 
@@ -208,17 +215,19 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
-		pra := arg_map{
+		pra := Arg_map{
 			FileName: filename,
 			Content:  string(content),
 		}
 		temp, _ := json.Marshal(pra)
 		c.map_queue.add(&MRTask{
 			TaskType: TYPE_MAP,
-			T:        time.Now().String(),
+			Id:       ID,
 			Arg:      string(temp),
 			Nreduce:  nReduce,
 		})
+		
+		ID++
 	}
 
 	c.server()
