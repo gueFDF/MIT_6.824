@@ -21,6 +21,7 @@ type Response struct {
 
 type Ack struct {
 	Id uint32
+	Filenames []string
 }
 
 // Add your RPC definitions here.
