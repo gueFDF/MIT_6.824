@@ -1,1 +1,3 @@
-# learn distribut
+# learn distribute
+# learn distribute
+# learn distribute
