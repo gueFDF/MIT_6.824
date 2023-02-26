@@ -93,6 +93,8 @@ type Raft struct {
 	//overtime time.Duration //超时时间
 	timer *time.Ticker //计时器
 
+	votenum int //获得票的总数
+
 	//TODO 2B
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -185,28 +187,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//TODO 重置超时选举时长
+	// 重置超时选举时长
 	rf.timer.Reset(getovertimr())
 	reply.Term = rf.currentTerm //用于领导人更新任期号
-	//当前leader已经落后
+	//1.当前leader已经落后
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
 
+	//2.
 	//重置ticker
 	rf.currentTerm = args.Term
 	rf.status = Follower
-	//	votenum = 0 //刷新选票
 	rf.voteFor = args.LeaderId
 
 	reply.Success = true
 	log.Println(rf.me, "收到来自", args.LeaderId, "的心跳包 ", "当前任期 ", rf.currentTerm, " 当前状态", rf.status)
 	currentLogIndex := len(rf.log) - 1
 
-	currentTerm := 0
+	//防止越界访问
+	currentLogTerm := 0
 	if currentLogIndex != -1 {
-		currentTerm = rf.log[currentLogIndex].Term
+		currentLogTerm = rf.log[currentLogIndex].Term
 	}
 	//判断该服务器的日志是否落后
 	if args.PrevLogIndex > currentLogIndex {
@@ -215,7 +218,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	//判断新旧日志是否冲突(索引值相同，任期号不同)
-	if args.PrevLogTerm != currentTerm {
+	if args.PrevLogTerm != currentLogTerm {
 		//删除这一条和之后所有的日志
 		rf.log = rf.log[:args.PrevLogIndex]
 		reply.Success = false
@@ -235,11 +238,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	return
-
 }
 
 func (rf *Raft) sendRequestAppend(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	for !ok {
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//当前leader已经落后，已经不再适合当选leader
+	if reply.Term > rf.currentTerm {
+		rf.status = Follower          //成为Follower
+		rf.currentTerm = reply.Term   //更新任期
+		rf.voteFor = -1               //重置选票
+		rf.timer.Reset(getovertimr()) //重置超时时间
+		rf.votenum = 0
+	}
+
 	return ok
 }
 
@@ -295,7 +312,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//最后一步查看自己是否有选票
 	if rf.voteFor != -1 && rf.voteFor != args.Candidateld {
-		reply.VoteGranted = false
+		reply.VoteGranted = false //没有选票了
 		return
 	}
 	log.Println(rf.me, " 将票投给 ", args.Candidateld, "当前状态 ", rf.status, " ", rf.voteFor)
@@ -333,10 +350,38 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args* RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	//远程调用失败，直至调用成功
 	for !ok {
 		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//获得选票
+	if reply.VoteGranted == true {
+		rf.votenum++
+	} else { //没有获得选票
+		//当前节点落后了，放弃选票
+		if reply.Term > rf.currentTerm {
+			//log.Println("放弃当leader")
+			rf.status = Follower          //成为Follower
+			rf.currentTerm = reply.Term   //更新任期
+			rf.voteFor = -1               //重置选票
+			rf.timer.Reset(getovertimr()) //重置超时时间
+			rf.votenum = 0
+		}
+
+	}
+	//判断获得选票数量(是否已经有资格成为leader)
+	if rf.votenum > len(rf.peers)/2 {
+		log.Println("server", rf.me, " 选举成功 ", "当前任期 ", rf.currentTerm)
+		//超过半数支持，成为领导者
+		rf.votenum = 0
+		rf.status = Leader
+		//rf.voteFor = -1               //重置选票
+		rf.timer.Reset(hearttimeout) //设置心跳包发送时长
 	}
 	return ok
 }
@@ -389,7 +434,6 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-var votenum int
 
 // 如果一段时间未收到心跳，开始选举
 func (rf *Raft) ticker() {
@@ -414,7 +458,7 @@ func (rf *Raft) ticker() {
 				log.Println("server", rf.me, " 开始选举 ", "当前状态", rf.status)
 				rf.voteFor = rf.me //将票投给自己
 				rf.currentTerm++   //自增当前任期号
-				votenum = 1
+				rf.votenum = 1
 				args := &RequestVoteArgs{
 					Term:         rf.currentTerm,
 					Candidateld:  rf.me,
@@ -432,40 +476,8 @@ func (rf *Raft) ticker() {
 					if i == rf.me {
 						continue
 					}
-					go func(server int) {
-						reply := &RequestVoteReply{}
-						is := rf.sendRequestVote(server, args, reply) //发起投票请求
-						if !is {
-							log.Println("sendRequestVote error")
-						}
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-						if reply.VoteGranted == true { //获得选票
-							votenum++
-							//log.Println("获得选票")
-						} else {
-							//当前节点落后了，放弃选票
-							if reply.Term > rf.currentTerm {
-								//log.Println("放弃当leader")
-								rf.status = Follower          //成为Follower
-								rf.currentTerm = reply.Term   //更新任期
-								rf.voteFor = -1               //重置选票
-								rf.timer.Reset(getovertimr()) //重置超时时间
-								votenum = 0
-							}
-
-						}
-						if votenum > len(rf.peers)/2 {
-							log.Println("server", rf.me, " 选举成功 ", "当前任期 ", rf.currentTerm)
-
-							//超过半数支持，成为领导者
-							votenum = 0
-							rf.status = Leader
-							//rf.voteFor = -1               //重置选票
-							rf.timer.Reset(hearttimeout) //立马开始发送心跳包
-
-						}
-					}(i)
+					reply := &RequestVoteReply{}
+					go rf.sendRequestVote(i, args, reply) //发起投票请求
 				}
 
 			case Leader:
@@ -485,16 +497,7 @@ func (rf *Raft) ticker() {
 						continue
 					}
 					reply := &AppendEntriesReply{}
-					go func(server int) {
-						rf.sendRequestAppend(server, args, reply)
-						if reply.Term > rf.currentTerm {
-							rf.status = Follower          //成为Follower
-							rf.currentTerm = reply.Term   //更新任期
-							rf.voteFor = -1               //重置选票
-							rf.timer.Reset(getovertimr()) //重置超时时间
-							//votenum = 0
-						}
-					}(i)
+					go rf.sendRequestAppend(i, args, reply)
 				}
 
 			}
