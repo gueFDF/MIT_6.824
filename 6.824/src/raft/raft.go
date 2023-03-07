@@ -20,7 +20,9 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -95,11 +97,7 @@ type Raft struct {
 
 	votenum int //获得票的总数
 
-	//TODO 2B
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
+	applyCh chan ApplyMsg
 }
 
 // 获取当前raft server 的状态
@@ -178,8 +176,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  //当前的任期号，用于领导人更新自己的任期号
-	Success bool //跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的日志时为真
+	Term     int  //当前的任期号，用于领导人更新自己的任期号
+	Success  bool //跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的日志时为真
+	Logindex int  //如果日志落后，应该发送的下一条日志的下标
 }
 
 // 附加日志的RPC函数
@@ -192,6 +191,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm //用于领导人更新任期号
 	//1.当前leader已经落后
 	if args.Term < rf.currentTerm {
+
 		reply.Success = false
 		return
 	}
@@ -203,7 +203,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.voteFor = args.LeaderId
 
 	reply.Success = true
-	log.Println(rf.me, "收到来自", args.LeaderId, "的心跳包 ", "当前任期 ", rf.currentTerm, " 当前状态", rf.status)
+
+	//fmt.Println(args.LeaderCommit, "  ", rf.commitIndex)
+	//更新当前server的最大日志提交索引
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), (float64(len(rf.log) - 1))))
+	}
+
+	// fmt.Println(rf.me, " rf.commitIndex: ", rf.commitIndex)
+	//进行日志提交
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		log.Println(rf.me, " 进行日志提交 ", rf.lastApplied)
+		//封装ApplyMsg
+		logmsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied+1,
+		}
+		//提交
+		rf.applyCh <- logmsg
+	}
+	if args.Entries == nil {
+		//是心跳包
+		//log.Println(rf.me, "收到来自", args.LeaderId, "的心跳包 ", "当前任期 ", rf.currentTerm, " 当前状态", rf.status)
+		return
+	}
+
 	currentLogIndex := len(rf.log) - 1
 
 	//防止越界访问
@@ -213,6 +239,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//判断该服务器的日志是否落后
 	if args.PrevLogIndex > currentLogIndex {
+		println(rf.me, " 该服务器的日志落后,", args.PrevLogIndex, " ", currentLogIndex)
+		reply.Logindex = currentLogIndex + 1
 		reply.Success = false
 		return
 	}
@@ -220,21 +248,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//判断新旧日志是否冲突(索引值相同，任期号不同)
 	if args.PrevLogTerm != currentLogTerm {
 		//删除这一条和之后所有的日志
+		println(rf.me, " 新旧日志冲突,", args.PrevLogTerm, " ", currentLogTerm)
 		rf.log = rf.log[:args.PrevLogIndex]
+		reply.Logindex = args.PrevLogIndex
 		reply.Success = false
 		return
 	}
 
 	//日志追加
 	rf.log = append(rf.log, args.Entries...)
-	//更新当前server的最大日志提交索引
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
-	}
-	//更新状态机
-	for rf.commitIndex > rf.lastApplied {
-		//TODO  log[lastApplied]应用到状态机当中
-		rf.lastApplied++
+	fmt.Println(rf.me, "  日志追加成功   ")
+	{
+		fmt.Println(rf.log[0].Command)
+		//temp:=reflect.ValueOf(args.Entries[0].Command)
+
 	}
 
 	return
@@ -381,6 +408,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.votenum = 0
 		rf.status = Leader
 		//rf.voteFor = -1               //重置选票
+
+		//初始nextIndext数组
+		for i := 0; i < len(rf.peers)-1; i++ {
+			rf.nextIndext[i] = len(rf.log)
+		}
 		rf.timer.Reset(hearttimeout) //设置心跳包发送时长
 	}
 	return ok
@@ -403,13 +435,122 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // 第二个返回值是当前任期号
 // 第三个返回值是否为leader
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//存放返回信息
+	index := 0
+	term := rf.currentTerm
+	isLeader := (rf.status == Leader)
 
-	// Your code here (2B).
+	//如果不是领导人就立刻返回
+	if !isLeader {
+		return index, term, isLeader
+	}
 
+	//封装日志信息
+	log := MsgLog{
+		Index:   rf.commitIndex,
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+
+	//先将日志写入自己
+	rf.log = append(rf.log, log)
+	index=len(rf.log)
+	rf.matchIndex[rf.me]++
+	lognum := 0
+	//将日志发送给其他节点
+	for i := 0; i < len(rf.peers); i++ {
+		//排除自己
+		if i == rf.me {
+			continue
+		}
+		//附加日志RPC的请求参数
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: len(rf.log) - 2,
+			PrevLogTerm:  0,
+			Entries:      rf.log[rf.nextIndext[i]:],
+			LeaderCommit: rf.commitIndex,
+		}
+		
+		//这样做是为了防止当log为nil时，地址的非法访问
+		if args.PrevLogIndex >= 0 {
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		}
+		reply := &AppendEntriesReply{}
+		fmt.Println(args,rf.nextIndext[i])
+		go rf.sendLog(i, args, reply, &lognum)
+
+	}
+
+	rf.timer.Reset(hearttimeout)
 	return index, term, isLeader
+}
+
+func (rf *Raft) sendLog(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, lognum *int) {
+
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	//远程调用失败，直至调用成功
+	for !ok {
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	}
+	log.Println(reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Success == false {
+		fmt.Println("472:sendLog false")
+		//当前节点已经落后
+		if rf.currentTerm < reply.Term {
+			println("473:当前节点日志落后:", rf.currentTerm, reply.Term)
+			rf.status = Follower          //成为Follower
+			rf.currentTerm = reply.Term   //更新任期
+			rf.voteFor = -1               //重置选票
+			rf.timer.Reset(getovertimr()) //重置超时时间
+			rf.votenum = 0
+			return
+		}
+		//发送的日志落后
+		println("对方日志落后,希望收到日志的Index:", reply.Logindex)
+		args.Entries = rf.log[reply.Logindex:]
+		args.PrevLogIndex = reply.Logindex - 1
+		if args.PrevLogIndex >= 0 {
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		}
+		reply = &AppendEntriesReply{}
+		//重新发送
+		temp := 0
+		rf.sendLog(server, args, reply, &temp)
+		return
+	} else {
+		log.Println("success")
+		*lognum++
+		if *lognum >= len(rf.peers)/2 {
+			rf.commitIndex += 1
+			*lognum = -9999
+		}
+		rf.nextIndext[server] += len(args.Entries) 
+		rf.matchIndex[server] = rf.nextIndext[server] - 1
+		//检测是否需要进行日志提交
+
+		//进行日志提交
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			log.Println(rf.me, " 进行日志提交 ", rf.lastApplied)
+			//封装ApplyMsg
+			logmsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied+1 ,
+			}
+			//提交
+			rf.applyCh <- logmsg
+		}
+
+	}
+	return
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -526,9 +667,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 	rf.currentTerm = 0
+	rf.applyCh = applyCh
 	rf.log = make([]MsgLog, 0)
 	rf.matchIndex = make([]int, len(peers))
 	rf.nextIndext = make([]int, len(peers))
