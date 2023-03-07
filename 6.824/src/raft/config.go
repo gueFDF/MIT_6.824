@@ -8,19 +8,23 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.824/labgob"
-import "6.824/labrpc"
-import "bytes"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import "math/rand"
-import crand "crypto/rand"
-import "math/big"
-import "encoding/base64"
-import "time"
-import "fmt"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"runtime"
+	"sync"
+	"testing"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -36,12 +40,13 @@ func makeSeed() int64 {
 	return x
 }
 
+// 配置
 type config struct {
 	mu        sync.Mutex
 	t         *testing.T
 	net       *labrpc.Network
 	n         int
-	rafts     []*Raft
+	rafts     []*Raft  //raft节点实例
 	applyErr  []string // from apply channel readers
 	connected []bool   // whether each server is on the net
 	saved     []*Persister
@@ -66,17 +71,18 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 		}
 		rand.Seed(makeSeed())
 	})
+	//设置最大CPU数
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
-	cfg.net = labrpc.MakeNetwork()
-	cfg.n = n
+	cfg.net = labrpc.MakeNetwork() //创建一个RPC节点
+	cfg.n = n                      //节点数量
 	cfg.applyErr = make([]string, cfg.n)
-	cfg.rafts = make([]*Raft, cfg.n)
-	cfg.connected = make([]bool, cfg.n)
-	cfg.saved = make([]*Persister, cfg.n)
-	cfg.endnames = make([][]string, cfg.n)
-	cfg.logs = make([]map[int]interface{}, cfg.n)
+	cfg.rafts = make([]*Raft, cfg.n)              //raft节点数组
+	cfg.connected = make([]bool, cfg.n)           //与其他节点是否连接
+	cfg.saved = make([]*Persister, cfg.n)         //用于持久化测试
+	cfg.endnames = make([][]string, cfg.n)        //RPC暴露的接口
+	cfg.logs = make([]map[int]interface{}, cfg.n) //保存每个节点持久化后的log
 	cfg.start = time.Now()
 
 	cfg.setunreliable(unreliable)
@@ -90,12 +96,12 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	// create a full set of Rafts.
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]interface{}{}
-		cfg.start1(i, applier)
+		cfg.start1(i, applier) //创建raft节点
 	}
 
 	// connect everyone
 	for i := 0; i < cfg.n; i++ {
-		cfg.connect(i)
+		cfg.connect(i) //每一个节点之间进行相互连接
 	}
 
 	return cfg
@@ -133,6 +139,7 @@ func (cfg *config) crash1(i int) {
 	}
 }
 
+// 检查该条日志是否重复写入，将日志写入到log[i]当中
 func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	err_msg := ""
 	v := m.Command
@@ -154,6 +161,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 
 // applier reads message from apply ch and checks that they match the log
 // contents
+// applier 从 apply ch 读取消息并检查它们是否与日志内容匹配
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
 		if m.CommandValid == false {
@@ -230,13 +238,11 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	}
 }
 
-//
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
 // allocate new outgoing port file names, and a new
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
-//
 func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	cfg.crash1(i)
 
@@ -433,6 +439,7 @@ func (cfg *config) checkNoLeader() {
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
+	//遍历所有raft节点
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.applyErr[i] != "" {
 			cfg.t.Fatal(cfg.applyErr[i])
@@ -443,12 +450,14 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Unlock()
 
 		if ok {
+			//检查日志是否具有一致性
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
 					index, cmd, cmd1)
 			}
 			count += 1
 			cmd = cmd1
+			//fmt.Println("test cmd: ",cmd1)
 		}
 	}
 	return count, cmd
@@ -513,20 +522,24 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			cfg.mu.Unlock()
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
-				if ok {
+				if ok { //当该节点是leader时，才会返回true
 					index = index1
 					break
 				}
 			}
 		}
 
-		if index != -1 {
+		if index != -1 { //找到leader
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
-			for time.Since(t1).Seconds() < 2 {
-				nd, cmd1 := cfg.nCommitted(index)
+			for time.Since(t1).Seconds() < 2 { //循环两秒
+
+				nd, cmd1 := cfg.nCommitted(index) //查看leader的日志是否已经提交
+
+				//fmt.Println("535: config", nd, " ", cmd1, " leader", index)
 				if nd > 0 && nd >= expectedServers {
+					//fmt.Println("test:", cmd1)
 					// committed
 					if cmd1 == cmd {
 						// and it was the command we submitted.
